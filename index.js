@@ -19,7 +19,7 @@ let userWallet;
 bot.command("start", async (ctx) => {
   const keyboard = [
     [{ text: "Import Wallet" }, { text: "Bulk Send ETH" }],
-    [{ text: "Help" }],
+    [{ text: "Bulk Send ERC20" }, { text: "Help" }],
   ];
   const userName = ctx.from.first_name;
 
@@ -40,7 +40,8 @@ bot.command("start", async (ctx) => {
 
     1️⃣ **Import Wallet**: Set up your Ethereum Wallet for transactions.
     2️⃣ **Bulk Send ETH**: Send ETH to multiple recipients.
-    3️⃣ **Help**: View the available commands and instructions.
+    3️⃣ **Bulk Send ERC20**: Send ERC20 tokens to multiple recipients.
+    4️⃣ **Help**: View the available commands and instructions.
 
     Please choose an action from the options below.`,
     options
@@ -50,7 +51,7 @@ bot.command("start", async (ctx) => {
 bot.command("menu", async (ctx) => {
   const keyboard = [
     [{ text: "Import Wallet" }, { text: "Bulk Send ETH" }],
-    [{ text: "Help" }],
+    [{ text: "Bulk Send ERC20" }, { text: "Help" }],
   ];
 
   const options = {
@@ -116,7 +117,6 @@ bot.on("text", async (ctx) => {
         break;
 
       case "/bulksendeth":
-        // Handle bulk ETH sending
         if (args.length === 0 || !userMessage.includes("-")) {
           await ctx.reply(
             "Invalid command format. Use: /bulksendeth recipient1,recipient2-amount1,amount2"
@@ -138,20 +138,16 @@ bot.on("text", async (ctx) => {
             return;
           }
 
-          // Notify the user the transaction is being processed
           const notifyMessage = await ctx.reply(
             "Processing your transaction... Please wait!"
           );
 
-          // Send transaction
           const txHash = await bulkSendEther(recipients, amounts);
 
-          // Notify the user with the transaction hash
           await ctx.reply(
             `Transaction is ongoing! Track it here: https://etherscan.io/tx/${txHash}`
           );
 
-          // Optionally, edit the initial message
           await ctx.telegram.editMessageText(
             notifyMessage.chat.id,
             notifyMessage.message_id,
@@ -169,12 +165,75 @@ bot.on("text", async (ctx) => {
         }
         break;
 
+      case "/bulkSendERC20":
+        if (args.length < 3) {
+          await ctx.reply(
+            "Invalid command format. Use: /bulkSendERC20 <tokenAddress> recipient1,recipient2-amount1,amount2"
+          );
+          return;
+        }
+
+        try {
+          const tokenAddress = args[0];
+          const [recipientsPart, amountsPart] = args
+            .slice(1)
+            .join(" ")
+            .split("-");
+          const recipients = recipientsPart
+            .split(",")
+            .map((address) => address.trim());
+          const amounts = amountsPart
+            .split(",")
+            .map((amount) => ethers.utils.parseUnits(amount.trim(), 18)); // Adjust for token decimals
+
+          if (recipients.length !== amounts.length) {
+            await ctx.reply("Recipient and Amount lists do not match!");
+            return;
+          }
+
+          const notifyMessage = await ctx.reply(
+            "Approving the bulk sender contract for token spending... Please wait."
+          );
+
+          const approvalTxHash = await approveToken(
+            userWallet,
+            tokenAddress,
+            "0x2bbe6252e559ea9c4d08b7cdba116ae837d0a7ac", // Bulk sender contract address
+            amounts.reduce((acc, val) => acc.add(val), ethers.BigNumber.from(0))
+          );
+
+          await ctx.reply(
+            `Approval successful! Tx: https://etherscan.io/tx/${approvalTxHash}`
+          );
+
+          const txHash = await bulkSendTokens(
+            userWallet,
+            tokenAddress,
+            recipients,
+            amounts
+          );
+
+          await ctx.reply(
+            `Bulk token transfer initiated! Tx: https://etherscan.io/tx/${txHash}`
+          );
+
+          await ctx.telegram.editMessageText(
+            notifyMessage.chat.id,
+            notifyMessage.message_id,
+            null,
+            `Transaction successfully initiated! Tracking link: https://etherscan.io/tx/${txHash}`
+          );
+        } catch (error) {
+          await ctx.reply(`Error during bulk token transfer: ${error.message}`);
+        }
+        break;
+
       default:
         await ctx.reply(
-          "Unknown command. Please use /importwallet or /bulksendeth."
+          "Unknown command. Please use /importwallet, /bulksendeth, or /bulkSendERC20."
         );
     }
-    return; // End command handling
+    return;
   }
 
   // Handle menu options
@@ -191,11 +250,18 @@ bot.on("text", async (ctx) => {
       );
       break;
 
+    case "Bulk Send ERC20":
+      await ctx.reply(
+        "Send the command with token address, recipient addresses, and amounts: /bulkSendERC20 <tokenAddress> recipient1,recipient2-amount1,amount2"
+      );
+      break;
+
     case "Help":
       await ctx.reply(
-        "This bot allows you to send Ethereum to multiple recipients. Use the following commands:\n\n" +
+        "This bot allows you to send Ethereum or ERC20 tokens to multiple recipients. Use the following commands:\n\n" +
           "/importwallet [private-key] - Import your ETH wallet\n" +
-          "/bulksendeth [recipients]-[amounts] - Send ETH to multiple recipients"
+          "/bulksendeth [recipients]-[amounts] - Send ETH to multiple recipients\n" +
+          "/bulkSendERC20 [tokenAddress] [recipients]-[amounts] - Send ERC20 tokens to multiple recipients"
       );
       break;
 
@@ -206,43 +272,33 @@ bot.on("text", async (ctx) => {
   }
 });
 
-// bot.command("importwallet", async (ctx) => {
-//   // Get the input after the /importwallet command
-//   const input = ctx.message.text.split(" ")[1]; // Get the input (wallet address or private key)
-//   console.log("input:::", input);
+// ERC20 Approval Function
+async function approveToken(wallet, tokenAddress, spenderAddress, amount) {
+  const contract = new ethers.Contract(tokenAddress, approveAbi, wallet);
 
-//   try {
-//     // If no input is provided, reply with a helpful message
-//     if (!input) {
-//       return ctx.reply(
-//         "Please provide a valid private key after the /importwallet command.\n\nExample: /importwallet YourPrivateKey"
-//       );
-//     }
+  const decimals = await contract.decimals(); // Retrieve token decimals
+  const amountInUnits = ethers.utils.parseUnits(amount.toString(), decimals);
 
-//     let wallet;
+  const tx = await contract.approve(spenderAddress, amountInUnits);
+  await tx.wait();
 
-//     // Check if input is a valid Ethereum address
-//     if (ethers.isAddress(input)) {
-//       // Treat the input as a wallet address
-//       wallet = new ethers.Wallet(input, provider);
-//       ctx.reply(`Wallet set to ${input}`);
-//     } else if (input.length === 64 || input.length === 66) {
-//       // Check if input is a valid private key (64 characters or 66 if prefixed with "0x")
-//       wallet = new ethers.Wallet(
-//         input.startsWith("0x") ? input : `0x${input}`,
-//         provider
-//       );
-//       ctx.reply(`Wallet set with private key. Address: ${wallet.address}`);
-//     } else {
-//       throw new Error("Invalid input! Not an Ethereum address or private key.");
-//     }
+  return tx.hash;
+}
 
-//     // Save the wallet globally (this is not secure; consider storing it in a database or encrypted storage)
-//     userWallet = wallet;
-//   } catch (error) {
-//     ctx.reply("Invalid input! Please provide a valid Ethereum private key.");
-//   }
-// });
+// BulkSendTokens function (already provided)
+async function bulkSendTokens(wallet, tokenAddress, recipients, amounts) {
+  const contractAddress = "0x2bbe6252e559ea9c4d08b7cdba116ae837d0a7ac";
+  const bulkSenderContract = new ethers.Contract(contractAddress, Abi, wallet);
+
+  const tx = await bulkSenderContract.bulkSendTokens(
+    tokenAddress,
+    recipients,
+    amounts
+  );
+  await tx.wait();
+
+  return tx.hash;
+}
 
 // Function to send bulk ETH
 
@@ -259,74 +315,6 @@ async function bulkSendEther(recipients, amounts) {
   await tx.wait();
   return tx.hash;
 }
-
-// Command to send bulk ETH
-// bot.command("bulksendeth", async (ctx) => {
-//   try {
-//     // Ensure the command has arguments
-//     const messageText = ctx.message.text;
-
-//     if (!messageText || !messageText.includes("-")) {
-//       ctx.reply(
-//         "Invalid command format. Use: /bulksendeth recipient1,recipient2-amount1,amount2"
-//       );
-//       return;
-//     }
-
-//     const args = messageText.split(" ")[1]; // Extract part after the space
-//     if (!args || !args.includes(",")) {
-//       ctx.reply(
-//         "Invalid command format. Use: /bulksendeth recipient1,recipient2-amount1,amount2"
-//       );
-//       return;
-//     }
-
-//     const [recipientsPart, amountsPart] = args.split("-"); // Split into recipients and amounts
-
-//     if (!recipientsPart || !amountsPart) {
-//       ctx.reply(
-//         "Invalid command format. Use: /bulksendeth recipient1,recipient2-amount1,amount2"
-//       );
-//       return;
-//     }
-
-//     // Parse recipients and amounts
-//     const recipients = recipientsPart
-//       .split(",")
-//       .map((address) => address.trim());
-//     const amounts = amountsPart
-//       .split(",")
-//       .map((amount) => ethers.parseEther(amount.trim()));
-
-//     if (recipients.length !== amounts.length) {
-//       ctx.reply("Recipient and Amount lists do not match!");
-//       return;
-//     }
-
-//     // Notify the user the transaction is being processed
-//     const notifyMessage = await ctx.reply(
-//       "Processing your transaction... Please wait!"
-//     );
-
-//     // Send transaction
-//     const txHash = await bulkSendEther(recipients, amounts);
-
-//     // Notify the user with the transaction hash
-//     await ctx.reply(
-//       `Transaction is ongoing! Track it here: https://etherscan.io/tx/${txHash}`
-//     );
-
-//     // Optionally, edit the initial message
-//     await ctx.telegram.editMessageText(
-//       notifyMessage.chat.id,
-//       notifyMessage.message_id,
-//       null,
-//       `Transaction successfully initiated! Tracking link: https://etherscan.io/tx/${txHash}`
-//     );
-//   } catch (error) {
-//     ctx.reply(`Error while processing your transaction: ${error.message}`);
-//   }
-// });
 
 // Start the bot
 bot
