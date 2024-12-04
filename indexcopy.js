@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 dotenv.config();
 
-import { Telegraf } from "telegraf";
+import { Telegraf, Markup } from "telegraf";
 import { ethers } from "ethers";
 import Abi from "./bulkSenderAbi.js";
 import approveAbi from "./approveAbi.js";
@@ -36,38 +36,81 @@ const helpMessage = `
 4️⃣ **See Help**
    - Type \`/help\` to see this guide again!
 
-🛠️ After importing your wallet, simply provide the required details to proceed with your transactions!
+🛠️ After selecting an action from the menu, simply provide the required details to proceed with your transactions!
 `;
 
+// Command: Start
 bot.start(async (ctx) => {
   const userName = ctx.from.first_name;
 
-  await ctx.reply(`Hello ${userName}! 👋
-Welcome to the Ethereum Bulk Sender Bot! 💸
-
-You can:
-- Import your wallet
-- Send ETH to multiple recipients
-- Send ERC20 tokens to multiple recipients
-
-Type /help to see detailed examples and formats for each action.`);
+  await ctx.reply(
+    `Hello ${userName}! 👋\nWelcome to the Ethereum Bulk Sender Bot! 💸`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("📜 Help", "show_help")],
+      [Markup.button.callback("🛠️ Import Private Key", "import_key")],
+      [
+        Markup.button.callback(
+          "💵 Send ETH to Multiple Recipients",
+          "send_eth"
+        ),
+      ],
+      [Markup.button.callback("🔗 Send ERC20 Tokens", "send_tokens")],
+    ])
+  );
 });
 
-// Display Help Menu
+// Command: Help
 bot.command("help", async (ctx) => {
   await ctx.reply(helpMessage, { parse_mode: "Markdown" });
 });
 
-// Handle user inputs dynamically
+// Action: Show Help
+bot.action("show_help", async (ctx) => {
+  await ctx.reply(helpMessage, { parse_mode: "Markdown" });
+  await ctx.answerCbQuery();
+});
+
+// Action: Import Private Key
+bot.action("import_key", async (ctx) => {
+  await ctx.reply("Please send your private key:");
+  await ctx.answerCbQuery();
+});
+
+// Action: Send ETH
+bot.action("send_eth", async (ctx) => {
+  try {
+    // Acknowledge the callback query immediately
+    await ctx.answerCbQuery();
+
+    // Then respond to the user
+    await ctx.reply(
+      "Please provide the details in the following format:\n\n`Recipient1,Recipient2-Amount1,Amount2`\n\nExample:\n`0xAbc123...,0xDef456...-0.1,0.2`",
+      { parse_mode: "Markdown" }
+    );
+  } catch (error) {
+    console.error("Error handling send_eth action:", error);
+  }
+});
+
+// Action: Send ERC20 Tokens
+bot.action("send_tokens", async (ctx) => {
+  await ctx.reply(
+    "Please provide the details in the following format:\n\n`TokenAddress Recipient1,Recipient2-Amount1,Amount2`\n\nExample:\n`0xTokenAddress123 0xAbc123...,0xDef456...-10,20`",
+    { parse_mode: "Markdown" }
+  );
+  await ctx.answerCbQuery();
+});
+
+// Handle user text input
 bot.on("text", async (ctx) => {
   const userMessage = ctx.message.text.trim();
 
-  // Check for private key or wallet address
+  // Check for private key
   if (isPrivateKey(userMessage)) {
     try {
       userWallet = new ethers.Wallet(userMessage, provider);
       await ctx.reply(
-        `Wallet successfully imported! 🎉\nAddress: ${userWallet.address}\n\nYou can now proceed to send ETH or ERC20 tokens. Type /help for examples.`
+        `Wallet successfully imported! 🎉\nAddress: ${userWallet.address}\n\nYou can now proceed to send ETH or ERC20 tokens.`
       );
     } catch (error) {
       await ctx.reply(
@@ -77,16 +120,51 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  // Check if the input includes a space
+  // Check for ETH transfer
+  if (userMessage.includes("-") && !userMessage.includes(" ")) {
+    const [recipientsPart, amountsPart] = userMessage.split("-");
+    const recipients = recipientsPart
+      .split(",")
+      .map((address) => address.trim());
+    const amounts = amountsPart
+      .split(",")
+      .map((amount) => ethers.parseEther(amount.trim()));
+
+    try {
+      if (!userWallet) {
+        await ctx.reply("Please import your wallet first.");
+        return;
+      }
+      if (recipients.length !== amounts.length) {
+        await ctx.reply(
+          "Mismatch between recipients and amounts. Please check your input."
+        );
+        return;
+      }
+
+      const notifyMessage = await ctx.reply(
+        "Processing your ETH transfer... Please wait."
+      );
+      const txHash = await bulkSendEther(recipients, amounts);
+
+      await ctx.telegram.editMessageText(
+        notifyMessage.chat.id,
+        notifyMessage.message_id,
+        null,
+        `ETH transaction successfully initiated! Track it here: https://etherscan.io/tx/${txHash}`
+      );
+    } catch (error) {
+      await ctx.reply(`Error during ETH transfer: ${error.message}`);
+    }
+    return;
+  }
+
+  // Check for token transfer
   if (userMessage.includes(" ")) {
-    // This is likely a token transfer
     const parts = userMessage.split(" ");
     if (parts.length !== 2) {
       await ctx.reply(
-        "Invalid token transfer format. Use:\n" +
-          "`0xTokenAddress Recipient1,Recipient2-Amount1,Amount2`\n" +
-          "Example:\n" +
-          "`0xYourTokenAddress 0xRecipient1,0xRecipient2-1.5,2.0`"
+        "Invalid format for token transfer. Use:\n`TokenAddress Recipient1,Recipient2-Amount1,Amount2`"
       );
       return;
     }
@@ -101,22 +179,13 @@ bot.on("text", async (ctx) => {
       .map((amount) => ethers.parseUnits(amount.trim(), 18));
 
     try {
-      // Validate and process token transfer
-      //   if (!ethers.isAddress(tokenAddress)) {
-      //     await ctx.reply(
-      //       "Invalid token address. Please provide a valid ERC20 token address."
-      //     );
-      //     return;
-      //   }
       if (!userWallet) {
-        await ctx.reply(
-          "Please import your wallet using the menu option before sending transactions."
-        );
+        await ctx.reply("Please import your wallet first.");
         return;
       }
       if (recipients.length !== amounts.length) {
         await ctx.reply(
-          "Mismatch between the number of recipients and amounts. Please try again."
+          "Mismatch between recipients and amounts. Please check your input."
         );
         return;
       }
@@ -143,59 +212,14 @@ bot.on("text", async (ctx) => {
     } catch (error) {
       await ctx.reply(`Error during token transfer: ${error.message}`);
     }
-  } else if (userMessage.includes("-")) {
-    // This is likely an ETH transfer
-    const [recipientsPart, amountsPart] = userMessage.split("-");
-    const recipients = recipientsPart
-      .split(",")
-      .map((address) => address.trim());
-    const amounts = amountsPart
-      .split(",")
-      .map((amount) => ethers.parseEther(amount.trim()));
-
-    try {
-      // Validate and process ETH transfer
-      if (!userWallet) {
-        await ctx.reply(
-          "Please import your wallet using the menu option before sending transactions."
-        );
-        return;
-      }
-      if (recipients.length !== amounts.length) {
-        await ctx.reply(
-          "Mismatch between the number of recipients and amounts. Please try again."
-        );
-        return;
-      }
-
-      const notifyMessage = await ctx.reply(
-        "Processing your ETH transfer... Please wait."
-      );
-      const txHash = await bulkSendEther(recipients, amounts);
-
-      await ctx.telegram.editMessageText(
-        notifyMessage.chat.id,
-        notifyMessage.message_id,
-        null,
-        `ETH transaction successfully initiated! Track it here: https://etherscan.io/tx/${txHash}`
-      );
-    } catch (error) {
-      await ctx.reply(`Error during ETH transfer: ${error.message}`);
-    }
-  } else {
-    // Invalid format
-    await ctx.reply(
-      "Invalid input. Please follow the correct format:\n\n" +
-        "**For ETH Transfers:**\n" +
-        "`Recipient1,Recipient2-Amount1,Amount2`\n\n" +
-        "**For Token Transfers:**\n" +
-        "`0xTokenAddress Recipient1,Recipient2-Amount1,Amount2`\n\n" +
-        "Use the menu options for more guidance."
-    );
+    return;
   }
+
+  // Invalid input
+  await ctx.reply("Invalid input. Type /help to see valid formats.");
 });
 
-// Utility: Detect if the input is a private key
+// Utility: Detect if input is a private key
 function isPrivateKey(input) {
   return (
     (input.length === 64 || (input.length === 66 && input.startsWith("0x"))) &&
@@ -208,16 +232,10 @@ async function approveTokenTransfer(wallet, tokenAddress, amounts) {
   const tokenContract = new ethers.Contract(tokenAddress, approveAbi, wallet);
   const bulkSenderAddress = "0x2bbe6252e559ea9c4d08b7cdba116ae837d0a7ac"; // Replace with your bulk sender contract address
 
-  console.log("amounts:::", amounts);
-
   const decimalsResult = await tokenContract.decimals();
-
-  // Convert amounts to full token units
   const amountArray = amounts.map((amt) =>
     ethers.parseUnits(amt, decimalsResult)
   );
-
-  // Calculate the total amount
   const totalAmount = amountArray.reduce(
     (acc, curr) => acc.add(curr),
     ethers.BigNumber.from(0)
@@ -225,7 +243,6 @@ async function approveTokenTransfer(wallet, tokenAddress, amounts) {
 
   const tx = await tokenContract.approve(bulkSenderAddress, totalAmount);
   await tx.wait();
-
   return tx.hash;
 }
 
@@ -235,16 +252,14 @@ async function bulkSendEther(recipients, amounts) {
   const contract = new ethers.Contract(contractAddress, Abi, userWallet);
 
   const totalAmount = amounts.reduce((acc, curr) => acc + curr, BigInt(0));
-
   const tx = await contract.bulkSendEther(recipients, amounts, {
     value: totalAmount,
   });
   await tx.wait();
-
   return tx.hash;
 }
 
-// Function to send bulk ERC20 tokens
+// Function to send bulk tokens
 async function bulkSendTokens(wallet, tokenAddress, recipients, amounts) {
   const contractAddress = "0x2bbe6252e559ea9c4d08b7cdba116ae837d0a7ac"; // Replace with your contract address
   const bulkSenderContract = new ethers.Contract(contractAddress, Abi, wallet);
@@ -255,11 +270,10 @@ async function bulkSendTokens(wallet, tokenAddress, recipients, amounts) {
     amounts
   );
   await tx.wait();
-
   return tx.hash;
 }
 
 // Start the bot
 bot.launch().then(() => {
-  console.log("Bot has been launched and is running...");
+  console.log("Bot has been launched and is running.");
 });
